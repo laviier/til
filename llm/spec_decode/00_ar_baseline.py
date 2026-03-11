@@ -8,20 +8,20 @@ autoregressive (AR) decoding is slow. This script makes it visceral.
 THE FUNDAMENTAL PROBLEM:
 ========================
 
-    ┌──────────────────────────────────────────────────────────────────┐
+    ┌─────────────────────────────────────────────────────────────────┐
     │ Autoregressive Decoding (one token at a time)                   │
-    │                                                                  │
+    │                                                                 │
     │  Step 1: Load ALL model weights + KV cache → Generate token 1   │
     │  Step 2: Load ALL model weights + KV cache → Generate token 2   │
     │  Step 3: Load ALL model weights + KV cache → Generate token 3   │
-    │  ...                                                             │
+    │  ...                                                            │
     │  Step N: Load ALL model weights + KV cache → Generate token N   │
-    │                                                                  │
-    │  Each step: ~10-30ms for a 70B model                             │
+    │                                                                 │
+    │  Each step: ~10-30ms for a 70B model                            │
     │  For 512 tokens: 512 × 20ms = 10.24 seconds                     │
-    │                                                                  │
-    │  The GPU is mostly WAITING for data to arrive from memory!       │
-    └──────────────────────────────────────────────────────────────────┘
+    │                                                                 │
+    │  The GPU is mostly WAITING for data to arrive from memory!      │
+    └─────────────────────────────────────────────────────────────────┘
 
     WHY is it memory-bound?
     
@@ -50,40 +50,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ─────────────────────────────────────────────────────────────────────
-# A tiny transformer for experimentation
-# ─────────────────────────────────────────────────────────────────────
-class TinyTransformer(nn.Module):
-    """A minimal GPT-style model. Small enough to run on any GPU."""
-    
-    def __init__(self, vocab_size=1000, hidden_size=256, num_layers=2, num_heads=4):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.pos_embed = nn.Embedding(2048, hidden_size)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size, nhead=num_heads, 
-            dim_feedforward=hidden_size * 4, batch_first=True,
-            dropout=0.0,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.vocab_size = vocab_size
-        
-    def forward(self, input_ids, positions=None):
-        """Forward pass. Returns logits for next token prediction."""
-        B, T = input_ids.shape
-        if positions is None:
-            positions = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        
-        x = self.embed(input_ids) + self.pos_embed(positions)
-        
-        # Causal mask: each position can only attend to previous positions
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=input_ids.device)
-        x = self.transformer(x, mask=causal_mask, is_causal=True)
-        logits = self.lm_head(x)
-        return logits
+from llm.mini_transformer import MiniTransformer
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -118,14 +85,16 @@ def autoregressive_generate(model, prompt_ids, max_new_tokens=64, temperature=0.
         # but it's still one-token-at-a-time
         logits = model(generated)
         
-        # Only use the last token's logits
-        next_logits = logits[:, -1, :]
+        # grab last token's scores, shape (B, vocab_size)
+        next_logits = logits[:, -1, :] 
         
         # Sample next token
         if temperature == 0:
+            # greedy — just take the highest score, no need for probabilities at all
             next_token = next_logits.argmax(dim=-1, keepdim=True)
         else:
-            probs = F.softmax(next_logits / temperature, dim=-1)
+            # convert to probabilities, with temperature scaling
+            probs = F.softmax(next_logits / temperature, dim=-1) # (B, vocab_size)
             next_token = torch.multinomial(probs, num_samples=1)
         
         generated = torch.cat([generated, next_token], dim=1)
@@ -149,9 +118,18 @@ def main():
     print("EXPERIMENT 1: Autoregressive Decoding Profile")
     print("="*70)
     
-    model = TinyTransformer(vocab_size=1000, hidden_size=256, num_layers=4, num_heads=4)
+    model = MiniTransformer(vocab_size=1000, hidden_size=256, num_layers=4, num_heads=4)
     model = model.to(device).eval()
     
+    # embed weights - token embed and pos embed: vocab * H * 2 
+    # Per transformer block (repeated × L):
+    #     Attention - q_proj, k_proj, v_proj, out_proj:  4 × (H × H)  =  4H²
+    #     FFN - up_proj is H × 4H = 4H² , down_proj is4H × H = 4H², totay is 8H²
+    #     layernorm: (2 per block, each has weight + bias = 2H params): 2 × 2H  =  4H
+    # Total transformer blocks: (12H² + 4H) * Layer
+    # final layernorm: 2H
+    # lm_head: H * V
+    # Total = 3*V*H + (12H² + 4H) * L + 2H
     num_params = sum(p.numel() for p in model.parameters())
     param_bytes = num_params * 2  # FP16 = 2 bytes
     print(f"Model: {num_params:,} parameters ({param_bytes/1e6:.1f} MB in FP16)")
@@ -177,12 +155,10 @@ def main():
     print("="*70)
     
     for hidden_size, num_layers in [(128, 2), (256, 4), (512, 8), (1024, 8)]:
-        model = TinyTransformer(
+        model = MiniTransformer(
             vocab_size=1000, hidden_size=hidden_size, 
             num_layers=num_layers, num_heads=4
         ).to(device).eval()
-        
-        num_params = sum(p.numel() for p in model.parameters())
         
         prompt = torch.randint(0, 1000, (1, 16), device=device)
         _ = autoregressive_generate(model, prompt, max_new_tokens=4)  # warmup
@@ -204,8 +180,6 @@ def main():
     - Each token requires loading ALL model weights from GPU memory
     - On H100: 140 GB weights / 3.35 TB/s bandwidth = 41.8 ms per token
     - That's only ~24 tokens/sec for a 70B model!
-    - The 989 TFLOPS of compute is almost completely unused
-    
     This is why speculative decoding helps:
     Instead of:  Load weights → 1 token → Load weights → 1 token → ...
     We do:       Load weights → verify K tokens at once → much better utilization!
@@ -213,7 +187,7 @@ def main():
     The key insight: verification of K tokens costs almost the same as
     generating 1 token, because the bottleneck is loading weights, not compute.
     """)
-    
+
     # ── Key Takeaways ──
     print("="*70)
     print("KEY TAKEAWAYS")
@@ -236,3 +210,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+python -m llm.spec_decode.00_ar_baseline
+Device: cuda
+
+======================================================================
+EXPERIMENT 1: Autoregressive Decoding Profile
+======================================================================
+Model: 3,793,408 parameters (7.6 MB in FP16)
+
+Per-token latency: 1.60 ms
+Tokens/sec: 625.4
+For 512 tokens: 0.82 seconds
+
+======================================================================
+EXPERIMENT 2: How Latency Scales with Model Size
+======================================================================
+  hidden= 128, layers=2, params=3.8M, latency=0.88ms, tok/s=1130
+  hidden= 256, layers=4, params=3.8M, latency=1.48ms, tok/s=677
+  hidden= 512, layers=8, params=3.8M, latency=2.94ms, tok/s=341
+  hidden=1024, layers=8, params=3.8M, latency=2.89ms, tok/s=346
+"""

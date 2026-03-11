@@ -50,31 +50,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Reuse TinyTransformer from 00_ar_baseline.py
-# ─────────────────────────────────────────────────────────────────────
-class TinyTransformer(nn.Module):
-    def __init__(self, vocab_size=1000, hidden_size=256, num_layers=2, num_heads=4):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.pos_embed = nn.Embedding(2048, hidden_size)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size, nhead=num_heads,
-            dim_feedforward=hidden_size * 4, batch_first=True, dropout=0.0,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.vocab_size = vocab_size
-
-    def forward(self, input_ids):
-        B, T = input_ids.shape
-        positions = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        x = self.embed(input_ids) + self.pos_embed(positions)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=input_ids.device)
-        x = self.transformer(x, mask=causal_mask, is_causal=True)
-        return self.lm_head(x)
-
+from llm.mini_transformer import MiniTransformer
 
 # ─────────────────────────────────────────────────────────────────────
 # Step 1: Draft K tokens from the draft model
@@ -103,7 +79,31 @@ def draft_tokens(draft_model, prefix, K, temperature=0.0):
       5. Append to sequence
       6. Save the probability distribution (needed for rejection sampling)
     """
-    raise NotImplementedError("YOUR TURN: Implement draft_tokens()")
+    generated = prefix.clone()
+    draft_token_ids = []
+    draft_probs_list = []
+
+    for i in range(K):
+        logits = draft_model(generated)
+        next_logits = logits[:, -1, :] # (1, vocab_size)
+        # probs = F.softmax(next_logits / max(temperature, 1e-8), dim=-1)  # (1, vocab_size)
+
+        if temperature == 0:
+            next_token = next_logits.argmax(dim=1, keepdim=True)
+            probs = torch.zeros_like(next_logits)      # probs = [[0.0, 0.0, 0.0, 0.0, 0.0]]
+            probs.scatter_(1, next_token, 1.0) #scatter_(dim, index, value), "along dimension 1, at the position given by next_token, write 1.0".
+        else:
+            probs = F.softmax(next_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        
+        draft_token_ids.append(next_token.item())
+        draft_probs_list.append(probs.squeeze(0)) # (vocab_size,)
+        generated = torch.cat([generated, next_token], dim=1)
+    
+    return (
+        torch.tensor(draft_token_ids, device=prefix.device), # [K]
+        torch.stack(draft_probs_list)                        # [K, vocab_size]
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -137,7 +137,15 @@ def verify_tokens(target_model, prefix, draft_token_ids, temperature=0.0):
          (these correspond to predicting d1, d2, ..., dK, and bonus)
       4. Convert to probabilities
     """
-    raise NotImplementedError("YOUR TURN: Implement verify_tokens()")
+    # draft_token_ids is [K] (1D) but prefix is [1, seq_len] (2D)
+    generated = torch.cat([prefix, draft_token_ids.unsqueeze(0)], dim=1)
+    logits = target_model(generated)
+
+    K = draft_token_ids.shape[0]
+    seq_len = prefix.shape[1]
+    verify_logits = logits[:, seq_len-1 : seq_len+K, :] # [1, K+1, vocab_size]
+    temp = temperature if temperature > 0 else 1.0 # always want the full probability distribution regardless of temperature, because rejection sampling needs p_target for all tokens, not just the chosen one.
+    return F.softmax(verify_logits / temp, dim=-1).squeeze(0)  # [K+1, vocab_size]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -184,7 +192,31 @@ def rejection_sample(draft_token_ids, draft_probs, target_probs):
         - Sample bonus from target_probs[K]
         - Return all K draft tokens + bonus
     """
-    raise NotImplementedError("YOUR TURN: Implement rejection_sample()")
+    K = draft_token_ids.shape[0]
+    accepted_tokens = []
+
+    for i in range(K):
+        d_i = draft_token_ids[i].item()
+        p_target = target_probs[i, d_i].item()
+        p_draft  = draft_probs[i, d_i].item()
+
+        acceptance_prob = min(1.0, p_target / (p_draft + 1e-10))
+
+        if torch.rand(1).item() < acceptance_prob: 
+            # accept
+            accepted_tokens.append(d_i)
+        else:
+            # reject — sample bonus from residual distribution
+            residual = torch.clamp(target_probs[i] - draft_probs[i], min=0.0)
+            residual = residual / (residual.sum() + 1e-10)  # normalize to a valid probability distribution again so sum up to 1
+            bonus = torch.multinomial(residual, num_samples=1).item()
+            accepted_tokens.append(bonus)
+            return accepted_tokens, len(accepted_tokens) - 1  # -1 because bonus isn't a draft token
+    
+    # all K accepted — sample bonus from target at position K
+    bonus = torch.multinomial(target_probs[K], num_samples=1).item()
+    accepted_tokens.append(bonus)
+    return accepted_tokens, K
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -229,17 +261,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Target model: larger
-    target = TinyTransformer(vocab_size=1000, hidden_size=512, num_layers=8, num_heads=4)
+    target = MiniTransformer(vocab_size=1000, hidden_size=512, num_layers=8, num_heads=4)
     target = target.to(device).eval()
     
     # Draft model: smaller (should be ~4-8x faster)
-    draft = TinyTransformer(vocab_size=1000, hidden_size=128, num_layers=2, num_heads=4)
+    draft = MiniTransformer(vocab_size=1000, hidden_size=128, num_layers=2, num_heads=4)
     draft = draft.to(device).eval()
     
     print(f"Target: {sum(p.numel() for p in target.parameters())/1e6:.1f}M params")
     print(f"Draft:  {sum(p.numel() for p in draft.parameters())/1e6:.1f}M params")
     
     prompt = torch.randint(0, 1000, (1, 16), device=device)
+
+    # In main(), add this sanity check:
+    print("\n--- Sanity check: same model as draft and target ---")
+    same_model = MiniTransformer(vocab_size=1000, hidden_size=256, num_layers=4, num_heads=4).to(device).eval()
+    output, rate = speculative_decode(same_model, same_model, prompt, max_new_tokens=32, K=5, temperature=1.0)
+    print(f"acceptance_rate with identical models: {rate:.2f}")  # should be ~1.0   
     
     # ── Compare AR vs SD for different K values ──
     print("\n" + "="*70)
@@ -260,6 +298,7 @@ def main():
     
     print("""
     KEY INSIGHT:
+    - Neither draft or target model is trained and both has random weights, so they output essentially random logits.
     - Higher K = more tokens per round IF acceptance rate stays high
     - But acceptance rate drops with larger K (harder to predict far ahead)
     - Sweet spot is usually K=3-7 depending on draft model quality
@@ -270,3 +309,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+python -m llm.spec_decode.01_spec_decode_from_scratch
+Target: 26.5M params
+Draft:  0.7M params
+
+--- Sanity check: same model as draft and target ---
+acceptance_rate with identical models: 1.00
+
+======================================================================
+Speculative Decoding vs Autoregressive
+======================================================================
+  K= 1: acceptance_rate=0.00, time=300ms, tokens/round=1.0
+  K= 3: acceptance_rate=0.00, time=384ms, tokens/round=1.0
+  K= 5: acceptance_rate=0.00, time=492ms, tokens/round=1.0
+  K= 7: acceptance_rate=0.00, time=605ms, tokens/round=1.0
+  K=10: acceptance_rate=0.00, time=762ms, tokens/round=1.0
+
+    KEY INSIGHT:
+    - Neither draft or target model is trained and both has random weights, so they output essentially random logits.
+    - Higher K = more tokens per round IF acceptance rate stays high
+    - But acceptance rate drops with larger K (harder to predict far ahead)
+    - Sweet spot is usually K=3-7 depending on draft model quality
+"""

@@ -36,14 +36,3 @@ Prerequisite: Complete the `compilation/` series first.
    ▼
 09-10: SSD-specific (disaggregation + speculation cache)
 ```
-
-## Time estimate
-
-| Scripts | Topic | Time |
-|---------|-------|------|
-| 00-02 | Foundations | 2-3 days |
-| 03-04 | vLLM tracing | 1-2 days |
-| 05-06 | Advanced drafting | 2-3 days |
-| 07-08 | Systems | 2-3 days |
-| 09-10 | SSD-specific | 2-3 days |
-| **Total** | | **~10-14 days** |

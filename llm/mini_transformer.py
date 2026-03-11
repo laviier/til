@@ -118,4 +118,4 @@ class MiniTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
-        return self.lm_head(x)  # (B, T, vocab_size)
+        return self.lm_head(x)  # (B, T, hidden_size) → (B, T, vocab_size), logits raw scores, NOT probabilities
