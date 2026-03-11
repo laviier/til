@@ -165,6 +165,7 @@ def main():
         _, times = autoregressive_generate(model, prompt, max_new_tokens=32)
         
         avg_time = sum(times[2:]) / len(times[2:])
+        num_params = sum(p.numel() for p in model.parameters())
         print(f"  hidden={hidden_size:4d}, layers={num_layers}, "
               f"params={num_params/1e6:.1f}M, "
               f"latency={avg_time*1000:.2f}ms, "
@@ -227,8 +228,8 @@ For 512 tokens: 0.82 seconds
 ======================================================================
 EXPERIMENT 2: How Latency Scales with Model Size
 ======================================================================
-  hidden= 128, layers=2, params=3.8M, latency=0.88ms, tok/s=1130
-  hidden= 256, layers=4, params=3.8M, latency=1.48ms, tok/s=677
-  hidden= 512, layers=8, params=3.8M, latency=2.94ms, tok/s=341
-  hidden=1024, layers=8, params=3.8M, latency=2.89ms, tok/s=346
+  hidden= 128, layers=2, params=0.7M, latency=0.88ms, tok/s=1136
+  hidden= 256, layers=4, params=3.8M, latency=1.47ms, tok/s=679
+  hidden= 512, layers=8, params=26.5M, latency=2.88ms, tok/s=348
+  hidden=1024, layers=8, params=103.3M, latency=2.90ms, tok/s=345
 """

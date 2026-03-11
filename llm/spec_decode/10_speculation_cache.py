@@ -248,7 +248,7 @@ def saguaro_sample(draft_logits: torch.Tensor, F: int, C: float = 0.5) -> torch.
     top_f_idx = torch.topk(draft_logits, F).indices
     modified = draft_logits.clone()
     modified[top_f_idx] += math.log(max(C, 1e-10))
-    return F.softmax(modified, dim=0)
+    return torch.nn.functional.softmax(modified, dim=0)
 
 
 # =====================================================================

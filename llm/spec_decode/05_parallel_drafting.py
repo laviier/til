@@ -21,12 +21,23 @@ HOW IT WORKS:
     Parallel:
     ┌──────────────────────────────────────────────────┐
     │ Draft tok 1, tok 2, tok 3, tok 4, tok 5          │
-    │ (all in ONE forward pass with masked attention)   │
+    │ (all in ONE forward pass with masked attention)  │
     └──────────────────────────────────────────────────┘
     1 forward pass, each position sees ONLY the verified prefix
 
     The trick: use a special attention mask where draft positions
     can attend to the prefix but NOT to each other.
+
+The draft model is trained to understand: "When I see a `pard_token` at position k, 
+I should predict token k of the sequence given ONLY the prefix, 
+as if positions before me in the draft were unknown."
+
+Specifically, during training:
+
+1. The model sees: `[prefix, pard_token, pard_token, pard_token, pard_token, pard_token]`
+2. With the custom attention mask (prefix visible, drafts invisible to each other)
+3. It's trained to predict the correct token at each position independently
+4. Position embeddings tell it WHICH position to predict (d0=pos N, d1=pos N+1, etc.)
 
 vLLM config: speculative_config.parallel_drafting = True
 vLLM code:   SpecDecodeBaseProposer.set_inputs_first_pass() (else branch)
